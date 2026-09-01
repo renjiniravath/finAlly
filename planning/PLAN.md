@@ -168,6 +168,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - A single background task (simulator or Massive poller) writes to an in-memory price cache
 - The cache holds the latest price, previous price, and timestamp for each ticker
+- The cache tracks the union of the user's watchlist and any ticker with an open position — so a held ticker keeps a live price even after it's removed from the watchlist
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
 
@@ -175,7 +176,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
+- Server pushes price updates for every ticker in the cache (watchlist ∪ open positions) at the data source's refresh cadence — ~500ms for the simulator, or the configured poll interval when using Massive
 - Each SSE event contains ticker, price, previous price, timestamp, and change direction
 - Client handles reconnection automatically (EventSource has built-in retry)
 
@@ -260,6 +261,8 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
 | GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
 
+**Trade execution**: a trade fills at the latest price in the shared in-memory price cache (§6) at the moment the request is processed — no separate live-price lookup. A rejected trade (insufficient cash on buy, insufficient shares on sell, unknown ticker) returns `HTTP 400` with a JSON body `{"error": "<error_code>", "message": "<human-readable detail>"}`, using error codes `insufficient_cash`, `insufficient_shares`, and `invalid_ticker`. All trade rejections and failures are recorded via standard server-side structured logging (no separate tracing infrastructure needed at this scale).
+
 ### Watchlist
 | Method | Path | Description |
 |--------|------|-------------|
@@ -327,6 +330,8 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 
 If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
 
+When `trades` contains multiple entries, they execute sequentially in array order, each re-evaluating cash/position state after the previous one. A failed trade does not block the rest — remaining trades still attempt to execute, and every outcome (successes and failures) is reported back in the chat response.
+
 ### System Prompt Guidance
 
 The LLM should be prompted as "FinAlly, an AI trading assistant" with instructions to:
@@ -354,7 +359,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 
 - **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
 - **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
-- **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
+- **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight; a toggle switches the coloring metric between unrealized P&L (green = profit, red = loss) and daily % change
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
@@ -364,7 +369,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 ### Technical Notes
 
 - Use `EventSource` for SSE connection to `/api/stream/prices`
-- Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
+- Use Recharts for all four visualizations — main chart, watchlist sparklines, portfolio heatmap (its built-in `Treemap`), and P&L chart — so one charting library covers the whole app
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
@@ -386,6 +391,7 @@ Stage 2: Python 3.12 slim
   - uv sync (install Python dependencies from lockfile)
   - Copy frontend build output into a static/ directory
   - Expose port 8000
+  - HEALTHCHECK: periodic HTTP check against `/api/health`
   - CMD: uvicorn serving FastAPI app
 ```
 
@@ -442,7 +448,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 ### E2E Tests (in `test/`)
 
-**Infrastructure**: A separate `docker-compose.test.yml` in `test/` that spins up the app container plus a Playwright container. This keeps browser dependencies out of the production image.
+**Infrastructure**: A separate `docker-compose.test.yml` in `test/` that spins up the app container plus a Playwright container. This keeps browser dependencies out of the production image. A reset step runs at the end of the suite (fresh/ephemeral SQLite volume, or an explicit reset script) so repeated runs stay deterministic.
 
 **Environment**: Tests run with `LLM_MOCK=true` by default for speed and determinism.
 
